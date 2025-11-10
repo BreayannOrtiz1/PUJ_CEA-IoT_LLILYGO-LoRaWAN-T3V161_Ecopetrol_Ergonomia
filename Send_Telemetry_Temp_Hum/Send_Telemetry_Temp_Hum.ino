@@ -93,6 +93,29 @@ char* scrtxt[] = { ".", ".", ".", ".", ".", ".", ".", "CEA-IoT" };
 char buff[21];
 int last_text = 7;
 
+// === WATCHDOG Y CONTROL DE CONEXIÓN ===
+// unsigned long lastSuccessfulSend = 0;
+// const unsigned long MAX_TIME_WITHOUT_SEND = 30 * 60 * 1000; // 30 minutos
+// const unsigned long WIFI_CHECK_INTERVAL = 10000; // 10 segundos
+// const unsigned long MQTT_RECONNECT_INTERVAL = 30000; // 30 segundos
+// unsigned long lastWifiCheck = 0;
+// unsigned long lastMqttReconnectAttempt = 0;
+// bool wifiConnected = false;
+// bool mqttConnected = false;
+// int consecutiveFailures = 0;
+// const int MAX_CONSECUTIVE_FAILURES = 5;
+
+// === WATCHDOG Y CONTROL DE CONEXIÓN ===
+unsigned long lastSuccessfulSend = 0;
+const unsigned long MAX_TIME_WITHOUT_SEND = 30 * 60 * 1000; // 30 minutos
+const unsigned long WIFI_CHECK_INTERVAL = 10000; // 10 segundos
+unsigned long lastWifiCheck = 0;
+int consecutiveFailures = 0;
+const int MAX_CONSECUTIVE_FAILURES = 5;
+
+
+unsigned long telemetryFrequencyGlobal = DEFAULT_TELEMETRY_FREQUENCY;
+
 // Function to update OLED display
 static void printfifo() {
   int i;
@@ -118,12 +141,26 @@ static void insertfifo(char* new_text) {
 }
 
 // Function to get current timestamp in ISO 8601 format
-String getCurrentTimestamp() {
+String getCurrentTimestamp_Local() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
     Serial.println("Failed to obtain time for timestamp");
     return "2024-01-01T00:00:00Z";  // Fallback timestamp
   }
+
+  char timestamp[25];
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+  return String(timestamp);
+}
+
+// Function to get current timestamp in ISO 8601 format in UTC
+String getCurrentTimestamp() {
+  time_t now;
+  struct tm timeinfo;
+  
+  // Get current time in UTC
+  time(&now);
+  gmtime_r(&now, &timeinfo);  // Use gmtime_r for thread safety
 
   char timestamp[25];
   strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
@@ -215,7 +252,8 @@ bool fetchDeviceConfiguration() {
     deviceConfig.sendHumidity = true;
     deviceConfig.isActive = true;
     deviceConfig.telemetryFrequency = DEFAULT_TELEMETRY_FREQUENCY;
-    deviceConfig.azurePrimaryKey = IOT_CONFIG_DEVICE_KEY;
+    deviceConfig.azurePrimaryKey = IOT_CONFIG_SASTOKEN;
+    
   } else {
     Serial.println("DEBUG: Using configuration from endpoint");
     // Ya se configuró con los valores del endpoint
@@ -330,6 +368,109 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
   }
 }
 
+bool checkWiFiConnection() {
+   if (WiFi.status() == WL_CONNECTED) {
+    // Verificar que realmente tenemos internet
+    if (WiFi.localIP().toString() == "0.0.0.0") {
+      Serial.println("WiFi connected but no IP address");
+      return false;
+    }
+    return true;
+  } else {
+    Serial.println("WiFi disconnected. Attempting to reconnect...");
+    
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("WiFi Lost");
+    display.println("Reconnecting...");
+    display.display();
+    
+    // Intentar reconectar
+    WiFi.disconnect();
+    delay(1000);
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) { // 10 segundos máximo
+      delay(500);
+      attempts++;
+      Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi reconnected!");
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("WiFi Reconnected");
+      display.display();
+      delay(2000);
+      return true;
+    } else {
+      Serial.println("\nWiFi reconnection failed");
+      return false;
+    }
+  }
+}
+
+bool checkMqttConnection() {
+  if (mqtt_client == NULL) {
+    Serial.println("MQTT client not initialized");
+    return false;
+  }
+  
+  // Método NO INTRUSIVO para verificar conexión MQTT
+  // Simplemente intentamos enviar el telemetry normal sin forzar reconexión
+  // La reconexión automática del MQTT client se encargará de reconectar si es necesario
+  
+  return true; // Dejamos que MQTT client maneje la reconexión automáticamente
+
+}
+
+void systemWatchdog() {
+  unsigned long currentTime = millis();
+  
+  // Verificar WiFi periódicamente (cada 30 segundos en lugar de 10)
+  if (currentTime - lastWifiCheck > 30000) {
+    lastWifiCheck = currentTime;
+    
+    if (!checkWiFiConnection()) {
+      consecutiveFailures++;
+      Serial.println("WiFi check failed. Consecutive failures: " + String(consecutiveFailures));
+    } else {
+      // Resetear fallos solo si WiFi está bien
+      consecutiveFailures = 0;
+    }
+  }
+  
+  // Verificar si no se han enviado datos en 30 minutos
+  if (lastSuccessfulSend > 0 && (currentTime - lastSuccessfulSend) > MAX_TIME_WITHOUT_SEND) {
+    Serial.println("CRITICAL: No data sent in 30 minutes. Restarting...");
+    
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("WATCHDOG: 30min");
+    display.println("No data sent");
+    display.println("Restarting...");
+    display.display();
+    delay(5000);
+    
+    ESP.restart();
+  }
+  
+  // Si hay demasiados fallos consecutivos (15 = 7.5 minutos), reiniciar
+  if (consecutiveFailures >= 15) {
+    Serial.println("CRITICAL: Too many consecutive failures. Restarting...");
+    
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("TOO MANY ERRORS");
+    display.println("Restarting...");
+    display.display();
+    delay(5000);
+    
+    ESP.restart();
+  }
+}
 
 static void initializeIoTHubClient() {
   Serial.println("=== Initializing IoT Hub Client ===");
@@ -472,6 +613,7 @@ static int initializeMqttClient() {
   mqtt_config.network.disable_auto_reconnect = false;
   mqtt_config.broker.verification.certificate = (const char*)ca_pem;
   mqtt_config.broker.verification.certificate_len = (size_t)ca_pem_len;
+  mqtt_config.network.reconnect_timeout_ms = 10000; // 10 segundos para reconexión
 
   Serial.println("MQTT Config:");
   Serial.println("- URI: " + String(mqtt_config.broker.address.uri));
@@ -519,8 +661,31 @@ static void establishConnection() {
     Serial.println("WARNING: MQTT initialization failed, but continuing...");
   }
 
+   // Inicializar watchdog
+  lastSuccessfulSend = millis();
+  lastWifiCheck = millis();
+  consecutiveFailures = 0;
+
+  // Calcular frecuencia para mostrar
+  telemetryFrequencyGlobal = deviceConfig.telemetryFrequency > 0 ? 
+                           deviceConfig.telemetryFrequency : DEFAULT_TELEMETRY_FREQUENCY;
+
   insertfifo("SETUP DONE");
   printfifo();
+
+  // Convertir frecuencia a string y mostrar
+  char freqText[20];
+  if (telemetryFrequencyGlobal >= 1000) {
+    // Mostrar en segundos si es mayor a 1000 ms
+    sprintf(freqText, "Freq: %lu s", telemetryFrequencyGlobal / 1000);
+  } else {
+    // Mostrar en milisegundos
+    sprintf(freqText, "Freq: %lu ms", telemetryFrequencyGlobal);
+  }
+  insertfifo(freqText);
+  printfifo();
+
+  Serial.println("Frequency set to: " + String(telemetryFrequencyGlobal) + " ms");
 }
 
 // Initialize OLED display
@@ -538,21 +703,27 @@ static void initializeOLED() {
 }
 
 static void sendTelemetry() {
-  // Check if device is active before sending telemetry
+  readSensorsAndBuildPayload();
+ /// Verificar estado del dispositivo
   if (!deviceConfig.isActive) {
     Serial.println("Device is inactive, skipping telemetry send");
     return;
   }
 
-  // Check if MQTT client is initialized
-  if (mqtt_client == NULL) {
-    Serial.println("ERROR: MQTT client not initialized");
+  // Verificar conexiones
+  if (!checkWiFiConnection()) {
+    Serial.println("Cannot send telemetry: WiFi unavailable");
+    return;
+  }
+  
+  if (!checkMqttConnection()) {
+    Serial.println("Cannot send telemetry: MQTT unavailable");
     return;
   }
 
   Serial.println("Sending telemetry ...");
 
-  // Create telemetry topic
+  // Crear telemetry topic
   String telemetry_topic = "devices/" + String(device_id) + "/messages/events/";
 
   Serial.println("Topic: " + telemetry_topic);
@@ -566,12 +737,20 @@ static void sendTelemetry() {
     MQTT_QOS1,
     DO_NOT_RETAIN_MSG);
 
-  if (message_id == -1) {
-    Serial.println("Failed publishing - message_id = -1");
-  } else if (message_id == 0) {
-    Serial.println("Failed publishing - message_id = 0");
-  } else {
+  if (message_id > 0) {
     Serial.println("Message published successfully, ID: " + String(message_id));
+    lastSuccessfulSend = millis(); // Actualizar timestamp de último envío exitoso
+    consecutiveFailures = 0; // Resetear contador de fallos
+    
+    
+   
+  } else {
+    Serial.println("Failed publishing telemetry. Error: " + String(message_id));
+    consecutiveFailures++;
+    
+    // Actualizar display con error
+    insertfifo("Send FAILED");
+    printfifo();
   }
 }
 
@@ -691,10 +870,22 @@ void setup() {
 }
 
 void loop() {
-  readSensorsAndBuildPayload();
+   // Ejecutar watchdog en cada iteración
+  systemWatchdog();
+  
+  // Enviar telemetría
   sendTelemetry();
-  // Use configured frequency or default if not set
-  unsigned long frequency = deviceConfig.telemetryFrequency > 0 ? deviceConfig.telemetryFrequency : DEFAULT_TELEMETRY_FREQUENCY;
-  delay(frequency);  
-  fetchDeviceConfiguration();
+  
+  // Usar frecuencia configurada o default si no está configurada
+  unsigned long frequency = deviceConfig.telemetryFrequency > 0 ? 
+                           deviceConfig.telemetryFrequency : DEFAULT_TELEMETRY_FREQUENCY;
+  
+  delay(frequency);
+  
+  // Actualizar configuración periódicamente (cada 5 ciclos para no saturar)
+  static int configCounter = 0;
+  if (configCounter++ >= 5) {
+    fetchDeviceConfiguration();
+    configCounter = 0;
+  }
 }
